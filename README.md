@@ -65,11 +65,13 @@ uv run python submit.py
 
 This one command:
 
-1. Hashes `preprocessing/` and `training/` and builds both images with
+1. Creates the `ml-pipeline` namespace (idempotently)
+2. Hashes `preprocessing/` and `training/` and builds both images with
    content-addressed tags (`preprocess:<hash>`, `sklearn-regression:<hash>`)
-2. Submits a `PreprocessingJob` and **blocks until it completes**
-3. Fans out 4 `TrainingJob`s in parallel, one per value in `ALPHAS`
-4. Streams per-job logs, then cleans up every job it created
+3. Submits a `PreprocessingJob` and **blocks until it completes**
+4. Fans out 4 `TrainingJob`s in parallel, one per value in `ALPHAS`
+5. Streams per-job logs, then deletes the namespace — total teardown of
+   everything the run created
 
 ## SDK usage
 
@@ -100,6 +102,28 @@ preprocess = PreprocessingJob(name="preprocess", image="preprocess:tag")
 preprocess.submit(replace=True)
 preprocess.wait()                  # ordering guarantee: training starts after
 ```
+
+### Namespaces
+
+Isolate a pipeline in its own namespace; teardown is then a single call:
+
+```python
+from mlk8s import delete_namespace, ensure_namespace
+
+ensure_namespace("ml-pipeline")                      # idempotent — safe to
+                                                     # call every run
+TrainingJob(name="run-1", image=..., namespace="ml-pipeline")
+
+delete_namespace("ml-pipeline")                      # deletes EVERYTHING in it
+                                                     # and waits for termination
+```
+
+Both are idempotent: `ensure_namespace` treats "already exists" as success, and
+`delete_namespace` ignores missing namespaces. Deleting a namespace removes all
+contained jobs, pods, secrets, and services — the nuclear cleanup option. Note
+that creating namespaces needs broader RBAC than creating jobs, so on
+locked-down clusters an admin may need to pre-create them (`ensure_namespace`
+is still safe to call — it will see the existing namespace and move on).
 
 ### Parallel grid search
 
