@@ -1,10 +1,13 @@
-"""Base class for run-to-completion K8s batch Jobs, no YAML required.
+"""MLJob: a run-to-completion K8s batch Job, no YAML required.
 
-TrainingJob and PreprocessingJob are thin specializations of this;
-anything that is "run a container until it exits" belongs here.
+One class covers every ML pipeline stage — training, preprocessing,
+evaluation, and custom stages — with the stage recorded as the
+mlk8s/job-type label via the job_type parameter.
 """
+import re
 import time
 from collections.abc import Iterator
+from enum import StrEnum
 from pathlib import Path
 
 from kubernetes import client, watch
@@ -17,20 +20,33 @@ class TrainingError(Exception):
     """Raised when a job fails or cannot be submitted."""
 
 
-class Job:
+class MLJobType(StrEnum):
+    """Built-in pipeline stages. Custom DNS-safe strings are also accepted."""
+
+    TRAINING = "training"
+    PREPROCESSING = "preprocessing"
+    POSTPROCESSING = "postprocessing"
+    EVALUATION = "evaluation"
+
+
+# job_type becomes both a label value and the container name, so it must
+# satisfy the stricter of the two: a DNS-1123 label.
+_DNS_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class MLJob:
     """A K8s batch Job that runs a container to completion.
 
     The manifest is built entirely in Python; nothing is read from YAML.
-    Subclasses set job_type, which drives the mlk8s/job-type label and
-    the container name.
+    job_type sets the mlk8s/job-type label and the container name — pass an
+    MLJobType member or any DNS-safe string for custom stages.
     """
-
-    job_type = "job"
 
     def __init__(
         self,
         name: str,
         image: str,
+        job_type: MLJobType | str = MLJobType.TRAINING,
         namespace: str = "default",
         image_pull_policy: str = "IfNotPresent",
         image_pull_secrets: list[str] | None = None,
@@ -43,8 +59,16 @@ class Job:
         memory_request: str = "512Mi",
         memory_limit: str = "1Gi",
         backoff_limit: int = 1,
+        active_deadline_seconds: int | None = None,
         ttl_seconds_after_finished: int = 300,
     ):
+        job_type_str = str(job_type)
+        if not _DNS_LABEL.fullmatch(job_type_str):
+            raise ValueError(
+                f"job_type {job_type_str!r} must be DNS-safe "
+                "(lowercase alphanumeric and '-', 1-63 chars)"
+            )
+        self.job_type = job_type_str
         self.name = name
         self.image = image
         self.namespace = namespace
@@ -66,8 +90,20 @@ class Job:
         self.memory_request = memory_request
         self.memory_limit = memory_limit
         self.backoff_limit = backoff_limit
+        # Hard wall-clock cap measured from pod creation, INCLUDING time spent
+        # Pending — the guard against unschedulable jobs (e.g. requesting GPUs
+        # on a GPU-less cluster) hanging forever. The job fails with
+        # reason=DeadlineExceeded instead of pending indefinitely.
+        self.active_deadline_seconds = active_deadline_seconds
         self.ttl_seconds_after_finished = ttl_seconds_after_finished
-        self.batch, self.core = load_clients()
+        # Clients connect lazily on first API use, so constructing a job and
+        # rendering its manifest never require a cluster connection.
+        self.batch: client.BatchV1Api | None = None
+        self.core: client.CoreV1Api | None = None
+
+    def _ensure_clients(self) -> None:
+        if self.batch is None or self.core is None:
+            self.batch, self.core = load_clients()
 
     def build_manifest(self) -> dict:
         """Render the Job spec as a plain dict (dry-run/debug friendly)."""
@@ -96,6 +132,11 @@ class Job:
             "metadata": {"name": self.name, "labels": labels},
             "spec": {
                 "backoffLimit": self.backoff_limit,
+                **(
+                    {"activeDeadlineSeconds": self.active_deadline_seconds}
+                    if self.active_deadline_seconds is not None
+                    else {}
+                ),
                 "ttlSecondsAfterFinished": self.ttl_seconds_after_finished,
                 "template": {
                     "metadata": {"labels": {**labels, "job-name": self.name}},
@@ -113,6 +154,7 @@ class Job:
         }
 
     def exists(self) -> bool:
+        self._ensure_clients()
         try:
             self.batch.read_namespaced_job(self.name, self.namespace)
             return True
@@ -123,6 +165,7 @@ class Job:
 
     def submit(self, replace: bool = False) -> None:
         """Create the Job. With replace=True, delete any existing job first."""
+        self._ensure_clients()
         if self.exists():
             if not replace:
                 raise TrainingError(f"job {self.name!r} already exists in {self.namespace!r}")
@@ -132,9 +175,28 @@ class Job:
         except ApiException as e:
             raise TrainingError(f"failed to create job: {e.reason}") from e
 
-    def wait(self, timeout_seconds: int = 600, poll_interval: float = 2.0) -> None:
-        """Block until the Job completes; raise TrainingError on failure/timeout."""
+    def wait(
+        self,
+        timeout_seconds: int = 600,
+        schedule_timeout_seconds: int | None = 120,
+        poll_interval: float = 2.0,
+    ) -> None:
+        """Block until the Job completes; raise TrainingError on failure.
+
+        Fail-fast behavior:
+        - Fatal container states that retries cannot fix (bad image name,
+          ImagePullBackOff, missing ConfigMap/Secret refs) raise immediately.
+        - If any pod stays unschedulable longer than schedule_timeout_seconds,
+          raise with the scheduler's reason (e.g. "Insufficient nvidia.com/gpu").
+          The timer resets when scheduling succeeds, so transient queuing —
+          busy nodes, autoscaler scale-up — is tolerated. Set
+          schedule_timeout_seconds=None to disable, or raise it on
+          autoscaling clusters where node provisioning takes minutes.
+        """
+        self._ensure_clients()
         deadline = time.monotonic() + timeout_seconds
+        unschedulable_since: float | None = None
+        pending_reason: str | None = None
         while time.monotonic() < deadline:
             job = self.batch.read_namespaced_job(self.name, self.namespace)
             for condition in job.status.conditions or []:
@@ -142,10 +204,55 @@ class Job:
                     return
                 if condition.type == "Failed" and condition.status == "True":
                     raise TrainingError(f"job failed: {condition.reason} - {condition.message}")
+
+            pending_reason = self._check_pods()
+            if pending_reason is None:
+                unschedulable_since = None
+            else:
+                unschedulable_since = unschedulable_since or time.monotonic()
+                if (
+                    schedule_timeout_seconds is not None
+                    and time.monotonic() - unschedulable_since > schedule_timeout_seconds
+                ):
+                    raise TrainingError(
+                        f"job unschedulable for >{schedule_timeout_seconds}s: "
+                        f"{pending_reason}"
+                    )
             time.sleep(poll_interval)
-        raise TrainingError(f"job did not finish within {timeout_seconds}s")
+
+        suffix = f"; still unschedulable: {pending_reason}" if pending_reason else ""
+        raise TrainingError(f"job did not finish within {timeout_seconds}s{suffix}")
+
+    # Container waiting states that retries cannot fix — fail immediately.
+    _FATAL_WAITING_REASONS = {
+        "ErrImagePull",
+        "ImagePullBackOff",
+        "InvalidImageName",
+        "CreateContainerConfigError",
+    }
+
+    def _check_pods(self) -> str | None:
+        """Raise on fatal container errors; else return the unschedulable
+        reason if any pod can't be scheduled, else None."""
+        pods = self.core.list_namespaced_pod(
+            self.namespace, label_selector=f"job-name={self.name}"
+        )
+        unschedulable_reason: str | None = None
+        for pod in pods.items:
+            for cs in pod.status.container_statuses or []:
+                waiting = cs.state.waiting
+                if waiting and waiting.reason in self._FATAL_WAITING_REASONS:
+                    raise TrainingError(
+                        f"pod {pod.metadata.name} cannot start: "
+                        f"{waiting.reason} - {waiting.message}"
+                    )
+            for condition in pod.status.conditions or []:
+                if condition.type == "PodScheduled" and condition.status == "False":
+                    unschedulable_reason = condition.message
+        return unschedulable_reason
 
     def _pod_names(self) -> list[str]:
+        self._ensure_clients()
         pods = self.core.list_namespaced_pod(
             self.namespace, label_selector=f"job-name={self.name}"
         )
@@ -157,6 +264,7 @@ class Job:
         The log API returns 400 while a container is still in ContainerCreating,
         so streaming must wait for the pod to leave Pending first.
         """
+        self._ensure_clients()
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             pod = self.core.read_namespaced_pod(pod_name, self.namespace)
@@ -199,6 +307,7 @@ class Job:
         import json
         from base64 import b64encode
 
+        self._ensure_clients()
         config_path = Path.home() / ".docker" / "config.json"
         docker_config = json.loads(config_path.read_text())
         encoded = b64encode(
@@ -223,6 +332,7 @@ class Job:
 
     def delete(self) -> None:
         """Delete the Job and its pods. Safe to call when it doesn't exist."""
+        self._ensure_clients()
         try:
             self.batch.delete_namespaced_job(
                 self.name,

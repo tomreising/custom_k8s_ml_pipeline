@@ -1,15 +1,15 @@
 """Parallel fan-out: submit and manage a set of jobs as one unit.
 
-The primary use case is grid search — one TrainingJob per hyperparameter
+The primary use case is grid search — one MLJob per hyperparameter
 combination, all running concurrently in the cluster.
 """
 from collections.abc import Iterator
 
-from mlk8s.training import TrainingError, TrainingJob
+from mlk8s.jobs import MLJob, TrainingError
 
 
 class JobGroup:
-    def __init__(self, jobs: list[TrainingJob]):
+    def __init__(self, jobs: list[MLJob]):
         if not jobs:
             raise ValueError("JobGroup requires at least one job")
         names = [j.name for j in jobs]

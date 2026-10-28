@@ -1,16 +1,16 @@
-﻿"""Preprocess, then run a parallel grid search of training jobs.
+"""Preprocess, then run a parallel grid search of training jobs.
 
-Phase 1: the preprocess Job must complete before any training starts.
-Phase 2: one training Job per hyperparameter combination, all running
+Phase 1: the preprocess job must complete before any training starts.
+Phase 2: one training job per hyperparameter combination, all running
 concurrently in the cluster.
 """
 from pathlib import Path
 
 from mlk8s import (
     JobGroup,
-    PreprocessingJob,
+    MLJob,
+    MLJobType,
     TrainingError,
-    TrainingJob,
     build_image,
     content_tag,
     delete_namespace,
@@ -23,8 +23,8 @@ NAMESPACE = "ml-pipeline"
 ALPHAS = [0.001, 0.01, 0.1, 1.0]
 # Set False to keep finished jobs/pods in the namespace for post-run
 # inspection (logs, metrics comparison). They still expire automatically
-# via ttl_seconds_after_finished â€” raise TTL_SECONDS to keep them longer.
-CLEANUP = False
+# via ttl_seconds_after_finished — raise TTL_SECONDS to keep them longer.
+CLEANUP = True
 TTL_SECONDS = 3600
 
 # The pipeline lives in its own namespace: isolated from other workloads,
@@ -42,9 +42,10 @@ train_image = build_image(
 print(f"built images: {preprocess_image}, {train_image}")
 
 # Phase 1: preprocess (must finish before training starts)
-preprocess = PreprocessingJob(
+preprocess = MLJob(
     name="preprocess",
     image=preprocess_image,
+    job_type=MLJobType.PREPROCESSING,
     namespace=NAMESPACE,
     ttl_seconds_after_finished=TTL_SECONDS,
 )
@@ -55,12 +56,13 @@ for line in preprocess.stream_logs():
 preprocess.wait()
 print("preprocess succeeded")
 
-# Phase 2: grid search â€” one job per alpha, all in parallel
+# Phase 2: grid search — one job per alpha, all in parallel
 group = JobGroup(
     [
-        TrainingJob(
+        MLJob(
             name=f"train-alpha-{a}",
             image=train_image,
+            job_type=MLJobType.TRAINING,
             namespace=NAMESPACE,
             env={"ALPHA": str(a)},
             gpus=0,  # default: CPU-only. For accelerators: gpus=1 (NVIDIA
@@ -90,9 +92,7 @@ if CLEANUP:
     delete_namespace(NAMESPACE)
 else:
     print(
-        f"grid search succeeded â€” runs kept in namespace {NAMESPACE!r} "
+        f"grid search succeeded — runs kept in namespace {NAMESPACE!r} "
         f"(expire {TTL_SECONDS}s after finishing). Inspect with:"
     )
     print(f"  kubectl logs -n {NAMESPACE} job/train-alpha-0.1")
-
-

@@ -7,3 +7,11 @@ requires-python = ">=3.14"
 dependencies = [
     "kubernetes>=37.0.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
